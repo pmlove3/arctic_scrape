@@ -1,3 +1,3 @@
 # arctic_scrape
 
-A tutorial on rvest
+A tutorial on rvest in R.
