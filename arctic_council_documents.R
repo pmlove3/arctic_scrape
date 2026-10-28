@@ -82,10 +82,10 @@ scrape <- map(q_url, safely(p_read)) %>% set_names(q_url)
 #saveRDS(scrape, "scrape.rds")
 
 #### Review and format document URLs ####
-scrape_result <- scrape %>% transpose()
+scrape_result <- scrape %>% list_transpose(simplify = FALSE)
 
 # Check if the errors are all empty, using the following logical evaluation
-sum(str_detect(scrape_result$error, "")) == length(scrape_result$error)
+all(map_lgl(scrape_result$error, is.null))
 
 # Create a tibble of all of the results and bind all rows using map_dfr
 scrape_res <- map_dfr(scrape_result$result, ~tibble(href = .x))
@@ -125,7 +125,7 @@ meta_extract <- function (doc_url) {
 }
 
 collected_meta_test <- map(scrape_res_mod$doc_url[1:2], safely(meta_extract)) %>%
-  transpose()
+  list_transpose(simplify = FALSE)
 
 # Inspect the test scrape
 collected_meta_test
@@ -135,7 +135,7 @@ length(scrape_res_mod$doc_url) * 10 / 60
 
 # Begin scraping a sample of only 5 documents
 collected_meta <- map(scrape_res_mod$doc_url[1:5], safely(meta_extract)) %>%
-  transpose() # Transpose list to combine list by result and error outcomes
+  list_transpose(simplify = FALSE) # Transpose list to combine list by result and error outcomes
 
 #### Review and format collected metadata
 collected_meta_result <- collected_meta$result %>%

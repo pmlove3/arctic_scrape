@@ -1,0 +1,269 @@
+---
+title: "Arctic Scraping Tutorial"
+subtitle: "Scraping Arctic Council documents with rvest"
+author: "Paul Love"
+format:
+  html:
+    toc: true
+    code-fold: false
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+## Overview
+
+This tutorial scrapes data about Arctic Council documents. Scraping gives us access to data that is not provided through an API.
+
+The scraping chunks below are shown but not run (`eval: false`), because they hit a live website with a 10 second crawl delay and the site may have changed. The results come from the saved `scrape.rds` and `collected_meta_result.rds` files in this repository, so the rest of the document runs offline.
+
+## Getting ready
+
+Load tidyverse, rvest and polite. Install any you do not already have. Alternatively, `pacman::p_load(tidyverse, rvest, polite)` loads and installs them in one step.
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(rvest)
+```
+
+```{r}
+#| label: setup-polite
+#| eval: false
+library(polite)
+```
+
+```{r}
+#| label: main-url
+main_url <- "https://oaarchive.arctic-council.org/"
+```
+
+Selector Gadget makes it easy to identify the CSS selector you want to use. Visit <https://selectorgadget.com/> and either drag the bookmarklet to your browser's toolbar or install the Chrome extension. The browser's developer tools work too.
+
+Check whether the site permits scraping and whether it sets a crawl delay:
+
+```{r}
+#| label: bow
+#| eval: false
+bow <- bow(main_url)
+bow
+```
+
+The site allows scraping with a 10 second delay, which a custom function can enforce.
+
+```{r}
+#| label: slow-read
+slow_read <- function(url) {
+  read <- read_html(url)
+  Sys.sleep(10) # 10 second pause
+  read
+}
+```
+
+## Format search
+
+Copy the URL from page 2 of the search results:
+
+```{r}
+#| label: copied-url
+copied_url <- "https://oaarchive.arctic-council.org/discover?rpp=100&etal=0&scope=/&group_by=none&page=2&sort_by=dc.date.issued_dt&order=asc&filtertype_0=author&filter_relational_operator_0=equals&filter_0=Arctic+Council"
+```
+
+Note the parameters in the URL:
+
+- `rpp=100` requests 100 results per page.
+- `sort_by=dc.date.issued_dt` with `order=asc` sorts results by date, oldest first.
+- `filter_0=Arctic+Council` limits the search to documents authored directly by the Arctic Council.
+
+Replace the page number parameter with `{pn}` so a vector of page numbers can fill it in. There were 5 pages at 2021-01-25 02:32:40 UTC.
+
+```{r}
+#| label: q-url
+pn <- 1:5
+
+q_url <- str_glue("https://oaarchive.arctic-council.org/discover?rpp=100&etal=0&scope=/&group_by=none&page={pn}&sort_by=dc.date.issued_dt&order=asc&filtertype_0=author&filter_relational_operator_0=equals&filter_0=Arctic+Council")
+
+# Confirm that the page numbers have been added
+head(q_url)
+```
+
+Use Selector Gadget to find the CSS selector that matches each document entry.
+
+```{r}
+#| label: css-select
+#| eval: false
+css_select <- "#aspect_discovery_SimpleSearch_div_search-results a"
+read_html(q_url[1]) %>%
+  html_nodes(css = css_select) %>%
+  html_attr(name = "href")
+```
+
+Each page returns 200 hrefs for 100 results, so every href appears twice. The duplicates are removed later.
+
+## Automate scraping with purrr
+
+```{r}
+#| label: purrr-pipeline
+#| eval: false
+css_select <- "#aspect_discovery_SimpleSearch_div_search-results a"
+
+p_css <- partial(html_nodes, css = css_select) # Prefill the CSS selector
+p_attr <- partial(html_attr, name = "href")    # Prefill the HTML attribute
+
+# Build a purrr custom function
+p_read <- compose(p_attr,
+                  p_css,
+                  slow_read # custom function from earlier, with crawl delay
+                  )
+
+scrape <- map(q_url, safely(p_read)) %>% set_names(q_url)
+
+# Save your work
+saveRDS(scrape, "scrape.rds")
+```
+
+Load the saved result instead of scraping again:
+
+```{r}
+#| label: load-scrape
+scrape <- readRDS("scrape.rds")
+```
+
+## Review and format document URLs
+
+`safely()` returns a `result` and an `error` for every page. `list_transpose()` regroups the list by outcome, so all results sit together and all errors sit together. It replaces `purrr::transpose()`, which is superseded as of purrr 1.0.0. `simplify = FALSE` keeps each element as a list.
+
+```{r}
+#| label: transpose-scrape
+scrape_result <- scrape %>% list_transpose(simplify = FALSE)
+
+# Check that no page returned an error
+all(map_lgl(scrape_result$error, is.null))
+```
+
+Build one tibble from all of the results with `map_dfr()`:
+
+```{r}
+#| label: scrape-res
+scrape_res <- map_dfr(scrape_result$result, ~tibble(href = .x))
+```
+
+The first result's full link is <https://oaarchive.arctic-council.org/handle/11374/2047>. The scraped hrefs are only the tail of each document URL, so add a base URL to the front.
+
+```{r}
+#| label: scrape-res-mod
+base_url <- "https://oaarchive.arctic-council.org"
+
+scrape_res_mod <- scrape_res %>%
+  distinct(href) %>%                     # Remove duplicate href values
+  mutate(doc_url = str_c(base_url, href)) # Append base_url to the front of href
+
+scrape_res_mod
+```
+
+## Scraping the metadata
+
+A custom function extracts the metadata for one document and returns a tibble.
+
+```{r}
+#| label: meta-extract
+meta_extract <- function(doc_url) {
+  # Scrape data from page with 10 second delay
+  data <- slow_read(doc_url)
+
+  title <- html_nodes(data, css = ".first-page-header") %>%
+    html_text()
+
+  abstract <- html_nodes(data, css = ".simple-item-view-description div") %>%
+    html_text()
+
+  date <- html_nodes(data, css = ".simple-item-view-date") %>%
+    html_text(trim = TRUE) %>% # Remove the white space indicating a next line
+    str_sub(start = 5, end = 8) # Remove the word "Date" and extract the year
+
+  author <- html_nodes(data, css = ".simple-item-view-authors div") %>%
+    html_text()
+
+  tib <- tibble(title, date, author, abstract, doc_url)
+
+  tib
+}
+```
+
+Test it on the first two documents, then estimate the time a full scrape would take.
+
+```{r}
+#| label: meta-test
+#| eval: false
+collected_meta_test <- map(scrape_res_mod$doc_url[1:2], safely(meta_extract)) %>%
+  list_transpose(simplify = FALSE)
+
+# Inspect the test scrape
+collected_meta_test
+```
+
+Estimated time for scraping with the delay, in minutes:
+
+```{r}
+#| label: time-estimate
+length(scrape_res_mod$doc_url) * 10 / 60
+```
+
+Begin with a sample of 5 documents:
+
+```{r}
+#| label: meta-sample
+#| eval: false
+collected_meta <- map(scrape_res_mod$doc_url[1:5], safely(meta_extract)) %>%
+  list_transpose(simplify = FALSE) # Regroup by result and error outcomes
+
+collected_meta_result <- collected_meta$result %>%
+  bind_rows() # Combine all of the results into one tibble
+
+collected_meta_error <- collected_meta$error %>%
+  bind_rows() # Combine all of the errors into one tibble
+
+# Save your work
+saveRDS(collected_meta_result, "collected_meta_result.rds")
+```
+
+Load the previously scraped file with the full data so we can explore it:
+
+```{r}
+#| label: load-meta
+collected_meta_result <- readRDS("collected_meta_result.rds")
+
+collected_meta_result
+```
+
+## Exploring the data
+
+How many documents were released in 1998?
+
+```{r}
+#| label: q-1998
+collected_meta_result %>%
+  filter(date == 1998) %>%
+  count()
+```
+
+How many documents refer to Canada?
+
+```{r}
+#| label: q-canada
+collected_meta_result %>%
+  mutate(canada = grepl("canad", abstract, ignore.case = TRUE)) %>%
+  filter(canada == TRUE) %>%
+  count()
+```
+
+How many documents refer to the EU?
+
+```{r}
+#| label: q-eu
+collected_meta_result %>%
+  mutate(eu = grepl("European Union", abstract, ignore.case = FALSE)) %>%
+  filter(eu == TRUE) %>%
+  count()
+```
